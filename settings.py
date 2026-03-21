@@ -1,0 +1,144 @@
+"""Constants and configuration for the Tamagotchi game."""
+
+# Window
+SCREEN_WIDTH = 480
+SCREEN_HEIGHT = 640
+FPS = 60
+TITLE = "Tamagotchi"
+
+# Game states
+STATE_MENU = "MENU"
+STATE_PET_SELECT = "PET_SELECT"
+STATE_PLAYING = "PLAYING"
+STATE_PET_RAN_AWAY = "PET_RAN_AWAY"
+
+# Pet types
+PET_CAT = "cat"
+PET_DOG = "dog"
+
+# Pet action states
+ACTION_IDLE = "idle"
+ACTION_EATING = "eating"
+ACTION_PLAYING = "playing"
+ACTION_SLEEPING = "sleeping"
+ACTION_SICK = "sick"
+ACTION_RUNNING_AWAY = "running_away"
+
+# Stats
+STAT_MAX = 100
+STAT_START = 80
+STAT_SICK_THRESHOLD = 15
+
+# Decay rates (per second)
+HUNGER_DECAY_DAY = 1.5
+HUNGER_DECAY_NIGHT = 0.5
+HAPPINESS_DECAY = 1.0
+ENERGY_DECAY_DAY = 0.8
+ENERGY_DECAY_NIGHT_AWAKE = 1.2
+ENERGY_RESTORE_SLEEPING = 2.0
+CLEANLINESS_DECAY = 0.5
+
+# Action restore amounts
+FEED_AMOUNT = 35
+PLAY_AMOUNT = 30
+CLEAN_AMOUNT = 40
+
+# Action durations (seconds)
+ACTION_DURATION = 2.0
+
+# Sickness
+SICK_TIMER_LIMIT = 30.0  # seconds before pet runs away
+
+# Day/night cycle (seconds)
+DAY_LENGTH = 300  # 5 minutes total
+DAY_PHASE_LENGTH = 210  # 3.5 minutes of day
+NIGHT_PHASE_LENGTH = 90  # 1.5 minutes of night
+
+# Evolution thresholds
+EVOLUTION_THRIVING = 70
+EVOLUTION_SCRUFFY = 40
+
+# Layout
+STAT_BAR_X = 40
+STAT_BAR_Y_START = 50
+STAT_BAR_WIDTH = 300
+STAT_BAR_HEIGHT = 18
+STAT_BAR_SPACING = 30
+STAT_BAR_LABEL_WIDTH = 80
+
+PET_CENTER_X = SCREEN_WIDTH // 2
+PET_CENTER_Y = 320
+
+GROUND_Y = 460
+
+BUTTON_Y = 540
+BUTTON_WIDTH = 90
+BUTTON_HEIGHT = 50
+BUTTON_SPACING = 15
+BUTTON_COUNT = 4
+
+# Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+DARK_GRAY = (60, 60, 60)
+LIGHT_GRAY = (200, 200, 200)
+MID_GRAY = (130, 130, 130)
+
+# Sky colors
+SKY_DAY = (135, 206, 235)
+SKY_SUNSET = (255, 140, 60)
+SKY_NIGHT = (25, 25, 80)
+SKY_DAWN = (255, 180, 120)
+
+# Grass
+GRASS_GREEN = (80, 160, 60)
+GRASS_DARK = (60, 130, 45)
+
+# Stat bar colors
+COLOR_HUNGER = (230, 120, 50)
+COLOR_HAPPINESS = (255, 200, 50)
+COLOR_ENERGY = (100, 180, 255)
+COLOR_CLEANLINESS = (130, 220, 130)
+COLOR_STAT_BG = (50, 50, 50)
+COLOR_STAT_BORDER = (80, 80, 80)
+
+# Button colors
+COLOR_BUTTON = (70, 70, 90)
+COLOR_BUTTON_HOVER = (90, 90, 120)
+COLOR_BUTTON_TEXT = (240, 240, 240)
+
+# Pet colors - Cat (orange tabby)
+CAT_BODY = (230, 160, 60)
+CAT_BODY_DARK = (200, 130, 40)
+CAT_BELLY = (250, 220, 170)
+CAT_STRIPE = (180, 110, 30)
+CAT_NOSE = (230, 130, 130)
+
+# Pet colors - Dog (golden)
+DOG_BODY = (200, 160, 80)
+DOG_BODY_DARK = (170, 130, 60)
+DOG_BELLY = (240, 210, 160)
+DOG_NOSE = (60, 40, 30)
+DOG_TONGUE = (230, 120, 120)
+
+# Evolution color modifiers
+THRIVING_TINT = 20   # add brightness
+SCRUFFY_TINT = -30   # subtract brightness
+
+# Particle colors
+SPARKLE_COLOR = (255, 255, 180)
+STAR_COLOR = (255, 220, 80)
+ZZZ_COLOR = (180, 180, 220)
+SWEAT_COLOR = (150, 200, 255)
+FOOD_COLOR = (200, 140, 60)
+
+# UI
+COLOR_TITLE = (255, 220, 100)
+COLOR_SUBTITLE = (200, 200, 220)
+COLOR_MOOD_TEXT = (220, 220, 240)
+COLOR_DAY_TEXT = (255, 255, 255)
+
+# Audio
+SAMPLE_RATE = 22050
+AUDIO_CHANNELS = 1
+AUDIO_BUFFER = 512
