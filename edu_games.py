@@ -33,9 +33,11 @@ from settings import (
     WORDBOOK_HEADER_H, WORDBOOK_TAB_H, WORDBOOK_SCROLL_IMPULSE,
     WORDBOOK_STAR_SIZE, WORDBOOK_MASTERED_COLOR, WORDBOOK_LEARNING_COLOR,
     WORDBOOK_NEW_COLOR, TIER_UNLOCK_THRESHOLD,
+    SESSION_LEARNING_DURATION,
+    STREAK_SHOW_THRESHOLD, STREAK_SPARKLE_THRESHOLD, STREAK_AMAZING_THRESHOLD,
 )
 from vocabulary import (get_random_words, get_distractors, get_smart_words,
-                        get_unlocked_tier)
+                        get_unlocked_tier, get_session_words)
 
 def _get_difficulty(level):
     """Return difficulty index 0=easy, 1=medium, 2=hard based on pet level."""
@@ -1113,6 +1115,445 @@ def _calc_edu_result(score, max_score):
 
 
 # ---------------------------------------------------------------------------
+# Learning Session — Persistent word set + timer across games
+# ---------------------------------------------------------------------------
+
+class LearningSession:
+    """Manages a learning session: word set, timer, streak, game count.
+
+    Created once when the child starts their first edu game.
+    Persists across multiple games until timer expires or manually ended.
+    """
+
+    def __init__(self, mastery_data, tier_unlock=None):
+        self.new_words, self.review_words = get_session_words(
+            mastery_data, tier_unlock)
+        self.all_words = self.new_words + self.review_words
+        self._new_english = {w[1] for w in self.new_words}
+        self._review_english = {w[1] for w in self.review_words}
+
+        self.timer = SESSION_LEARNING_DURATION  # counts down
+        self.games_played = 0
+        self.total_xp = 0
+        self.best_streak = 0
+
+        # Per-word tracking: {english: {"correct": N, "wrong": N, "seen": bool}}
+        self.word_progress = {}
+        for w in self.all_words:
+            self.word_progress[w[1]] = {"correct": 0, "wrong": 0, "seen": False}
+
+        self.active = True
+        self.intro_shown = False  # True after WordIntro has been displayed
+
+    def is_new_word(self, english):
+        return english in self._new_english
+
+    def is_review_word(self, english):
+        return english in self._review_english
+
+    def record_game_result(self, word_results, xp_earned):
+        """Record results from a completed game."""
+        self.games_played += 1
+        self.total_xp += xp_earned
+        for english, correct in word_results:
+            if english in self.word_progress:
+                self.word_progress[english]["seen"] = True
+                if correct:
+                    self.word_progress[english]["correct"] += 1
+                else:
+                    self.word_progress[english]["wrong"] += 1
+
+    def update(self, dt):
+        """Tick session timer. Returns True if session just expired."""
+        if not self.active:
+            return False
+        self.timer -= dt
+        if self.timer <= 0:
+            self.timer = 0
+            self.active = False
+            return True
+        return False
+
+    def get_words_for_game(self, count):
+        """Return a subset of session words for a single game."""
+        pool = list(self.all_words)
+        random.shuffle(pool)
+        return pool[:min(count, len(pool))]
+
+    @property
+    def words_learned_count(self):
+        """Count of new words that progressed (got at least 1 correct)."""
+        return sum(1 for e in self._new_english
+                   if self.word_progress.get(e, {}).get("correct", 0) > 0)
+
+    @property
+    def time_remaining_str(self):
+        mins = int(self.timer) // 60
+        secs = int(self.timer) % 60
+        return f"{mins}:{secs:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Word Intro — "Today's Words" pre-game screen
+# ---------------------------------------------------------------------------
+
+class WordIntro:
+    """Shows session words before the first game. Child taps each to hear it."""
+
+    def __init__(self, session, sound):
+        self.session = session
+        self.sound = sound
+        self.done = False
+        self.result = "ready"  # always "ready" when done
+
+        self._tapped = set()  # english words that have been tapped
+        self._card_rects = []
+        self._divider_y = 0
+        self._ready_rect = pygame.Rect(0, 0, 200, 46)
+        self._build_layout()
+
+    def _build_layout(self):
+        card_w, card_h = 300, 60
+        gap = 6
+        header_h = 60
+        divider_h = 24
+        n_new = len(self.session.new_words)
+        n_rev = len(self.session.review_words)
+
+        total_cards = n_new + n_rev
+        total_h = header_h + n_new * (card_h + gap) + divider_h + \
+                  n_rev * (card_h + gap) + 60
+        start_y = max(10, (SCREEN_HEIGHT - total_h) // 2)
+
+        y = start_y + header_h
+        self._card_rects = []
+        # New words
+        for w in self.session.new_words:
+            r = pygame.Rect((SCREEN_WIDTH - card_w) // 2, y, card_w, card_h)
+            self._card_rects.append((r, w, "new"))
+            y += card_h + gap
+
+        self._divider_y = y + 4
+        y += divider_h
+
+        # Review words
+        for w in self.session.review_words:
+            r = pygame.Rect((SCREEN_WIDTH - card_w) // 2, y, card_w, card_h)
+            self._card_rects.append((r, w, "review"))
+            y += card_h + gap
+
+        self._header_y = start_y
+        self._ready_rect = pygame.Rect(
+            (SCREEN_WIDTH - 200) // 2, y + 8, 200, 46)
+
+    @property
+    def _all_tapped(self):
+        return len(self._tapped) >= len(self.session.all_words)
+
+    def handle_event(self, event, mouse_pos):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # Check card taps
+            for r, w, kind in self._card_rects:
+                if r.collidepoint(mouse_pos) and w[1] not in self._tapped:
+                    self._tapped.add(w[1])
+                    if self.sound:
+                        self.sound.speak(w[1])
+                    return
+            # Check ready button
+            if self._all_tapped and self._ready_rect.collidepoint(mouse_pos):
+                self.done = True
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.done = True
+                self.result = None
+
+    def update(self, dt):
+        pass
+
+    def draw(self, surface, mouse_pos):
+        _draw_overlay_bg(surface)
+        font_title = pygame.font.SysFont("Arial", 30, bold=True)
+        font_sub = pygame.font.SysFont("Arial", 18)
+        font_polish = pygame.font.SysFont("Arial", 22, bold=True)
+        font_english = pygame.font.SysFont("Arial", 17)
+        font_badge = pygame.font.SysFont("Arial", 12, bold=True)
+        font_btn = pygame.font.SysFont("Arial", 20, bold=True)
+        font_divider = pygame.font.SysFont("Arial", 13)
+
+        # Header
+        # Session timer
+        timer_surf = font_sub.render(
+            f"\u23F1 {self.session.time_remaining_str}",
+            True, (100, 220, 140))
+        surface.blit(timer_surf, (SCREEN_WIDTH - timer_surf.get_width() - 20,
+                                  self._header_y + 12))
+
+        title = font_title.render("Today's Words", True, OVERLAY_TITLE_COLOR)
+        surface.blit(title, (20, self._header_y + 8))
+
+        sub_text = "All words heard! Ready to play" if self._all_tapped \
+            else "Tap each word to hear it"
+        sub = font_sub.render(sub_text, True, (180, 180, 200))
+        surface.blit(sub, (20, self._header_y + 42))
+
+        # Divider between new and review
+        if self.session.review_words:
+            div_text = font_divider.render("Review", True, (128, 128, 152))
+            dw = div_text.get_width()
+            dy = self._divider_y
+            line_y = dy + 7
+            pygame.draw.line(surface, (58, 53, 96),
+                             (40, line_y),
+                             (SCREEN_WIDTH // 2 - dw // 2 - 10, line_y), 1)
+            surface.blit(div_text, (SCREEN_WIDTH // 2 - dw // 2, dy))
+            pygame.draw.line(surface, (58, 53, 96),
+                             (SCREEN_WIDTH // 2 + dw // 2 + 10, line_y),
+                             (SCREEN_WIDTH - 40, line_y), 1)
+
+        # "New Words" divider above new words
+        if self.session.new_words and self._card_rects:
+            first_r = self._card_rects[0][0]
+            nw_text = font_divider.render("New Words", True, (128, 128, 152))
+            nw_w = nw_text.get_width()
+            nw_y = first_r.y - 18
+            pygame.draw.line(surface, (58, 53, 96),
+                             (40, nw_y + 7),
+                             (SCREEN_WIDTH // 2 - nw_w // 2 - 10, nw_y + 7), 1)
+            surface.blit(nw_text, (SCREEN_WIDTH // 2 - nw_w // 2, nw_y))
+            pygame.draw.line(surface, (58, 53, 96),
+                             (SCREEN_WIDTH // 2 + nw_w // 2 + 10, nw_y + 7),
+                             (SCREEN_WIDTH - 40, nw_y + 7), 1)
+
+        # Word cards
+        t = pygame.time.get_ticks() / 1000.0
+        for r, w, kind in self._card_rects:
+            english = w[1]
+            tapped = english in self._tapped
+            hovered = r.collidepoint(mouse_pos) and not tapped
+
+            # Card background
+            if tapped:
+                bg = (34, 42, 38)
+                border_color = (80, 180, 104)
+            elif hovered:
+                bg = (58, 54, 88)
+                border_color = (128, 112, 192)
+            else:
+                bg = (42, 40, 64)
+                # Pulse animation for untapped cards
+                pulse = 0.5 + 0.5 * math.sin(t * 2.5 + hash(english) % 10)
+                bc = int(80 + 48 * pulse)
+                border_color = (bc, int(bc * 0.85), int(bc * 1.3))
+
+            pygame.draw.rect(surface, bg, r, border_radius=10)
+            pygame.draw.rect(surface, border_color, r,
+                             width=2, border_radius=10)
+
+            # Badge (NEW / REVIEW)
+            badge_text = "NEW" if kind == "new" else "REVIEW"
+            badge_color = (80, 180, 104) if kind == "new" else (224, 144, 64)
+            badge_surf = font_badge.render(badge_text, True, (255, 255, 255))
+            badge_w = badge_surf.get_width() + 10
+            badge_rect = pygame.Rect(r.right - badge_w - 6, r.y - 1,
+                                     badge_w, 16)
+            pygame.draw.rect(surface, badge_color, badge_rect,
+                             border_radius=4)
+            surface.blit(badge_surf, (badge_rect.x + 5, badge_rect.y + 1))
+
+            # Icon
+            icon_x = r.x + 30
+            icon_y = r.centery
+            _draw_vocab_icon(surface, icon_x, icon_y, w[3], size=14)
+
+            # Polish text
+            pol_surf = font_polish.render(w[0], True, WHITE)
+            surface.blit(pol_surf, (r.x + 58, r.y + 10))
+
+            # English text
+            eng_surf = font_english.render(w[1], True, (100, 180, 255))
+            surface.blit(eng_surf, (r.x + 58, r.y + 34))
+
+            # Checkmark or speaker
+            if tapped:
+                check = font_polish.render("\u2713", True, (80, 180, 104))
+                surface.blit(check, (r.right - 28,
+                                     r.centery - check.get_height() // 2))
+            else:
+                spk = font_english.render("\U0001F50A", True, (96, 96, 128))
+                surface.blit(spk, (r.right - 30,
+                                   r.centery - spk.get_height() // 2))
+
+        # Ready button
+        if self._all_tapped:
+            btn_color = (80, 180, 104)
+            btn_text_color = WHITE
+            label = "Ready to Play! \u25B6"
+        else:
+            btn_color = (58, 56, 96)
+            btn_text_color = (96, 96, 128)
+            label = "Tap all words first"
+        pygame.draw.rect(surface, btn_color, self._ready_rect,
+                         border_radius=10)
+        btn_surf = font_btn.render(label, True, btn_text_color)
+        surface.blit(btn_surf,
+                     (self._ready_rect.centerx - btn_surf.get_width() // 2,
+                      self._ready_rect.centery - btn_surf.get_height() // 2))
+
+
+# ---------------------------------------------------------------------------
+# Session Complete — End-of-session summary
+# ---------------------------------------------------------------------------
+
+class SessionComplete:
+    """Shows session summary when timer expires or child ends session."""
+
+    def __init__(self, session, mastery_data):
+        self.session = session
+        self.mastery_data = mastery_data
+        self.done = False
+        self.result = None
+        btn_y = SCREEN_HEIGHT - 70
+        self._btn_rect = pygame.Rect(
+            (SCREEN_WIDTH - 180) // 2, btn_y, 180, 46)
+
+    def handle_event(self, event, mouse_pos):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._btn_rect.collidepoint(mouse_pos):
+                self.done = True
+        elif event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_ESCAPE):
+                self.done = True
+
+    def update(self, dt):
+        pass
+
+    def draw(self, surface, mouse_pos):
+        _draw_overlay_bg(surface)
+        font_big = pygame.font.SysFont("Arial", 36, bold=True)
+        font_med = pygame.font.SysFont("Arial", 22)
+        font_small = pygame.font.SysFont("Arial", 16)
+        font_label = pygame.font.SysFont("Arial", 12)
+        font_status = pygame.font.SysFont("Arial", 13, bold=True)
+        font_btn = pygame.font.SysFont("Arial", 20, bold=True)
+        font_divider = pygame.font.SysFont("Arial", 11)
+
+        cx = SCREEN_WIDTH // 2
+
+        # Header
+        emoji = font_big.render("\U0001F389", True, WHITE)
+        surface.blit(emoji, (cx - emoji.get_width() // 2, 18))
+        heading = font_big.render("Session Complete!", True,
+                                  OVERLAY_TITLE_COLOR)
+        surface.blit(heading, (cx - heading.get_width() // 2, 56))
+        sub = font_med.render("Great practice today", True, (180, 180, 200))
+        surface.blit(sub, (cx - sub.get_width() // 2, 94))
+
+        # Stats row
+        stats = [
+            (str(self.session.games_played), "Games"),
+            (str(self.session.words_learned_count), "Learned"),
+            (str(self.session.best_streak), "Best Streak"),
+            (f"+{self.session.total_xp}", "Total XP"),
+        ]
+        stat_w = 70
+        stat_gap = 12
+        total_sw = len(stats) * stat_w + (len(stats) - 1) * stat_gap
+        sx = cx - total_sw // 2
+        sy = 128
+        for i, (value, label) in enumerate(stats):
+            bx = sx + i * (stat_w + stat_gap)
+            pygame.draw.rect(surface, (42, 40, 64),
+                             (bx, sy, stat_w, 52), border_radius=8)
+            v_surf = font_med.render(value, True, OVERLAY_TITLE_COLOR)
+            surface.blit(v_surf, (bx + stat_w // 2 - v_surf.get_width() // 2,
+                                  sy + 6))
+            l_surf = font_label.render(label, True, (128, 128, 152))
+            surface.blit(l_surf, (bx + stat_w // 2 - l_surf.get_width() // 2,
+                                  sy + 34))
+
+        # Divider
+        div_y = sy + 64
+        div_text = font_divider.render("TODAY'S WORDS", True, (176, 160, 216))
+        dw = div_text.get_width()
+        pygame.draw.line(surface, (58, 53, 96), (40, div_y + 5),
+                         (cx - dw // 2 - 8, div_y + 5), 1)
+        surface.blit(div_text, (cx - dw // 2, div_y))
+        pygame.draw.line(surface, (58, 53, 96), (cx + dw // 2 + 8, div_y + 5),
+                         (SCREEN_WIDTH - 40, div_y + 5), 1)
+
+        # Word rows
+        row_y = div_y + 20
+        row_h = 32
+        row_w = 300
+        for w in self.session.all_words:
+            english = w[1]
+            progress = self.session.word_progress.get(english, {})
+            correct = progress.get("correct", 0)
+            wrong = progress.get("wrong", 0)
+            is_new = self.session.is_new_word(english)
+            is_review = self.session.is_review_word(english)
+
+            rx = cx - row_w // 2
+            pygame.draw.rect(surface, (42, 40, 64),
+                             (rx, row_y, row_w, row_h), border_radius=6)
+
+            # Stars (mastery level)
+            box = self.mastery_data.get(english, {}).get("box", 0)
+            star_x = rx + 10
+            star_cy = row_y + row_h // 2
+            for si in range(3):
+                color = (255, 208, 96) if si < (box + 1) else (64, 64, 96)
+                _draw_mini_star(surface, star_x + si * 14, star_cy,
+                                WORDBOOK_STAR_SIZE, color)
+
+            # Word pair
+            pair = font_small.render(f"{w[0]} \u2192 {w[1]}", True,
+                                     (208, 208, 232))
+            surface.blit(pair, (rx + 52, row_y + row_h // 2 -
+                                pair.get_height() // 2))
+
+            # Status badge
+            if is_new and correct > 0:
+                status_text, status_color, status_bg = \
+                    "Learned!", (80, 180, 104), (80, 180, 104, 38)
+            elif is_review:
+                status_text, status_color, status_bg = \
+                    "Reviewed \u2713", (224, 144, 64), (224, 144, 64, 30)
+            elif correct == 0 and wrong > 0:
+                status_text, status_color, status_bg = \
+                    "Needs Work", (216, 128, 128), (216, 128, 128, 38)
+            elif correct > 0:
+                status_text, status_color, status_bg = \
+                    "Improving", (100, 180, 255), (100, 180, 255, 38)
+            else:
+                status_text, status_color, status_bg = \
+                    "Not seen", (128, 128, 152), (128, 128, 152, 30)
+
+            st_surf = font_status.render(status_text, True, status_color)
+            st_w = st_surf.get_width() + 10
+            st_rect = pygame.Rect(rx + row_w - st_w - 8,
+                                  row_y + (row_h - 18) // 2, st_w, 18)
+            # Semi-transparent badge background
+            badge_bg_surf = pygame.Surface((st_w, 18), pygame.SRCALPHA)
+            badge_bg_surf.fill((*status_color, 30))
+            surface.blit(badge_bg_surf, st_rect.topleft)
+            pygame.draw.rect(surface, status_color, st_rect,
+                             width=1, border_radius=4)
+            surface.blit(st_surf, (st_rect.x + 5,
+                                   st_rect.y + 1))
+
+            row_y += row_h + 4
+
+        # Done button
+        pygame.draw.rect(surface, (80, 180, 104), self._btn_rect,
+                         border_radius=10)
+        btn_surf = font_btn.render("Done \u2714", True, WHITE)
+        surface.blit(btn_surf,
+                     (self._btn_rect.centerx - btn_surf.get_width() // 2,
+                      self._btn_rect.centery - btn_surf.get_height() // 2))
+
+
+# ---------------------------------------------------------------------------
 # PlayMenu — Game Selection
 # ---------------------------------------------------------------------------
 
@@ -1128,10 +1569,13 @@ class PlayMenu:
         ("wordbook", "Word Book",    "See your progress",    ("book",     (180, 140, 120))),
     ]
 
-    def __init__(self):
+    def __init__(self, session=None):
         self.done = False
         self.result = None
+        self.session = session
         h = 48 + len(self.ITEMS) * PLAY_MENU_ROW_HEIGHT + 8
+        if session and session.active:
+            h += 48  # extra space for session banner + word dots
         self.rect = pygame.Rect(
             (SCREEN_WIDTH - PLAY_MENU_WIDTH) // 2,
             (SCREEN_HEIGHT - h) // 2 - 20,
@@ -1139,6 +1583,8 @@ class PlayMenu:
         )
         self._row_rects = []
         y = self.rect.y + 48
+        if session and session.active:
+            y += 48  # offset for banner
         for _ in self.ITEMS:
             r = pygame.Rect(self.rect.x + 8, y,
                             PLAY_MENU_WIDTH - 16, PLAY_MENU_ROW_HEIGHT)
@@ -1183,6 +1629,50 @@ class PlayMenu:
         surface.blit(title, (self.rect.centerx - title.get_width() // 2,
                              self.rect.y + 12))
 
+        # Session banner (if active)
+        if self.session and self.session.active:
+            banner_y = self.rect.y + 46
+            banner_rect = pygame.Rect(self.rect.x + 10, banner_y,
+                                      PLAY_MENU_WIDTH - 20, 22)
+            banner_surf = pygame.Surface(
+                (banner_rect.width, banner_rect.height), pygame.SRCALPHA)
+            banner_surf.fill((100, 220, 140, 20))
+            surface.blit(banner_surf, banner_rect.topleft)
+            pygame.draw.rect(surface, (100, 220, 140), banner_rect,
+                             width=1, border_radius=6)
+            sfont = pygame.font.SysFont("Arial", 14)
+            st = sfont.render(
+                f"\u23F1 Session active \u2014 "
+                f"{self.session.time_remaining_str} remaining",
+                True, (100, 220, 140))
+            surface.blit(st, (banner_rect.x + 8,
+                              banner_rect.centery - st.get_height() // 2))
+
+            # Word progress dots
+            dot_y = banner_y + 26
+            n_words = len(self.session.all_words)
+            dot_size = 6
+            dot_gap = 4
+            total_dw = n_words * (dot_size * 2) + (n_words - 1) * dot_gap
+            dot_x = self.rect.centerx - total_dw // 2
+            for w in self.session.all_words:
+                prog = self.session.word_progress.get(w[1], {})
+                if prog.get("correct", 0) > 0:
+                    color = (80, 180, 104)  # green = correct
+                elif prog.get("wrong", 0) > 0:
+                    color = (200, 80, 80)  # red = wrong
+                else:
+                    color = None  # unseen = empty
+                cx_dot = dot_x + dot_size
+                cy_dot = dot_y + dot_size
+                if color:
+                    pygame.draw.circle(surface, color,
+                                       (cx_dot, cy_dot), dot_size)
+                else:
+                    pygame.draw.circle(surface, (80, 74, 110),
+                                       (cx_dot, cy_dot), dot_size, 2)
+                dot_x += dot_size * 2 + dot_gap
+
         for i, (r, item) in enumerate(zip(self._row_rects, self.ITEMS)):
             key, name, subtitle, icon_hint = item
             hovered = r.collidepoint(mouse_pos)
@@ -1194,7 +1684,15 @@ class PlayMenu:
             label = font_name.render(f"{i + 1}. {name}", True, FOOD_MENU_TEXT)
             surface.blit(label, (r.x + 56, r.y + 6))
 
-            sub = font_sub.render(subtitle, True, (160, 160, 180))
+            # Show "Session words" subtitle for edu games during active session
+            if self.session and self.session.active and \
+                    key in ("memory", "falling", "spelling", "quiz"):
+                sub_text = "Session words"
+                sub_color = (100, 220, 140)
+            else:
+                sub_text = subtitle
+                sub_color = (160, 160, 180)
+            sub = font_sub.render(sub_text, True, sub_color)
             surface.blit(sub, (r.x + 56, r.y + 32))
 
 
@@ -1221,17 +1719,64 @@ class _EduGameBase:
         self._flash_color = None
         self.word_results = []  # [(english_word, correct_bool), ...]
 
+        # Streak tracking
+        self._streak = 0
+        self._best_streak = 0
+        self._streak_sparkles = []  # [(x, y, vx, vy, life)]
+        self._streak_flash_timer = 0.0
+
+        # Session reference (set by main.py if session active)
+        self.session = None
+
+        # Results screen state
+        self._results_scroll = 0
+        self._continue_rect = pygame.Rect(
+            (SCREEN_WIDTH - 180) // 2, SCREEN_HEIGHT - 65, 180, 44)
+
     def handle_event(self, event, mouse_pos):
-        if self._phase != "play":
-            return
-        self._on_event(event, mouse_pos)
+        if self._phase == "play":
+            self._on_event(event, mouse_pos)
+        elif self._phase == "results":
+            self._on_results_event(event, mouse_pos)
 
     def _on_event(self, event, mouse_pos):
         pass
 
+    def _on_results_event(self, event, mouse_pos):
+        """Handle events on the interactive results screen."""
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # Continue button
+            if self._continue_rect.collidepoint(mouse_pos):
+                self.done = True
+                return
+            # Speaker icons
+            cx = SCREEN_WIDTH // 2
+            row_w = 300
+            rx = cx - row_w // 2
+            y = 130 + self._results_scroll
+            for english, correct in self.word_results:
+                spk_rect = pygame.Rect(rx + row_w - 32, y + 4, 28, 28)
+                if spk_rect.collidepoint(mouse_pos):
+                    if self.sound:
+                        self.sound.speak(english)
+                    return
+                y += 36
+        elif event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                self.done = True
+
     def update(self, dt):
         if self._flash_timer > 0:
             self._flash_timer = max(0, self._flash_timer - dt)
+
+        # Update sparkles
+        self._streak_sparkles = [
+            (x + vx * dt, y + vy * dt, vx, vy, life - dt)
+            for x, y, vx, vy, life in self._streak_sparkles
+            if life - dt > 0
+        ]
+        if self._streak_flash_timer > 0:
+            self._streak_flash_timer = max(0, self._streak_flash_timer - dt)
 
         if self._phase == "play":
             self.timer -= dt
@@ -1240,9 +1785,7 @@ class _EduGameBase:
                 self.timer = 0
                 self._finish()
         elif self._phase == "results":
-            self._results_timer -= dt
-            if self._results_timer <= 0:
-                self.done = True
+            pass  # no auto-close — user clicks Continue
 
     def _update_play(self, dt):
         pass
@@ -1250,80 +1793,287 @@ class _EduGameBase:
     def _finish(self):
         self._phase = "results"
         self.result = _calc_edu_result(self.score, self.max_score)
-        self._results_timer = MINIGAME_RESULTS_DURATION
+        # Update session streak
+        if self.session:
+            self.session.best_streak = max(self.session.best_streak,
+                                           self._best_streak)
 
     def draw(self, surface, mouse_pos):
         _draw_overlay_bg(surface)
         if self._phase == "play":
             self._draw_play(surface, mouse_pos)
             self._draw_hud(surface)
+            self._draw_streak(surface)
+            self._draw_sparkles(surface)
         else:
-            self._draw_results(surface)
+            self._draw_results(surface, mouse_pos)
 
     def _draw_play(self, surface, mouse_pos):
         pass
 
     def _draw_hud(self, surface):
-        font_title = pygame.font.SysFont("Arial", 38, bold=True)
-        font_score = pygame.font.SysFont("Arial", 32)
+        font_title = pygame.font.SysFont("Arial", 34, bold=True)
+        font_score = pygame.font.SysFont("Arial", 28)
 
+        cx = SCREEN_WIDTH // 2
+
+        # Title + session timer on same row
         title_surf = font_title.render(self.title, True, OVERLAY_TITLE_COLOR)
-        surface.blit(title_surf,
-                     (SCREEN_WIDTH // 2 - title_surf.get_width() // 2, 16))
+        if self.session and self.session.active:
+            timer_font = pygame.font.SysFont("Arial", 16)
+            timer_surf = timer_font.render(
+                f"\u23F1 {self.session.time_remaining_str}", True,
+                (100, 220, 140))
+            # Title left, timer right
+            surface.blit(title_surf, (cx - title_surf.get_width() // 2, 12))
+            surface.blit(timer_surf, (SCREEN_WIDTH - timer_surf.get_width() - 16, 18))
+        else:
+            surface.blit(title_surf, (cx - title_surf.get_width() // 2, 12))
 
-        bar_w = 300
-        bar_h = 14
+        # Timer bar
+        bar_w = 260
+        bar_h = 12
         bar_x = (SCREEN_WIDTH - bar_w) // 2
-        bar_y = 54
+        bar_y = 48
         pygame.draw.rect(surface, OVERLAY_TIMER_BG,
-                         (bar_x, bar_y, bar_w, bar_h), border_radius=7)
+                         (bar_x, bar_y, bar_w, bar_h), border_radius=6)
         fill_w = int(bar_w * max(0, self.timer / self.duration))
         if fill_w > 0:
             pygame.draw.rect(surface, OVERLAY_TIMER_FG,
-                             (bar_x, bar_y, fill_w, bar_h), border_radius=7)
+                             (bar_x, bar_y, fill_w, bar_h), border_radius=6)
 
+        # Score
         score_surf = font_score.render(
             f"Score: {self.score}/{self.max_score}", True, OVERLAY_SCORE_COLOR)
-        surface.blit(score_surf,
-                     (SCREEN_WIDTH // 2 - score_surf.get_width() // 2, 74))
+        surface.blit(score_surf, (cx - score_surf.get_width() // 2, 64))
 
-    def _draw_results(self, surface):
-        font_big = pygame.font.SysFont("Arial", 50, bold=True)
-        font_med = pygame.font.SysFont("Arial", 36)
+    def _draw_streak(self, surface):
+        """Draw streak fire counter below the score."""
+        if self._streak < STREAK_SHOW_THRESHOLD and \
+                self._streak_flash_timer <= 0:
+            return
+        cx = SCREEN_WIDTH // 2
+        y = 90
+        font_streak = pygame.font.SysFont("Arial", 18, bold=True)
 
-        cy = SCREEN_HEIGHT // 2 - 60
+        streak = self._streak
+        if streak <= 0 and self._streak_flash_timer <= 0:
+            return
 
+        # Fire icons
+        fires = min(streak, 7)
+        fire_text = "\U0001F525" * fires
+        fire_surf = font_streak.render(fire_text, True, (255, 128, 64))
+        surface.blit(fire_surf, (cx - fire_surf.get_width() // 2, y))
+
+        # Label
+        if streak >= STREAK_AMAZING_THRESHOLD:
+            label = f"{streak} \u2014 AMAZING!"
+            color = (255, 107, 53)
+            font_size = 17
+        elif streak >= STREAK_SPARKLE_THRESHOLD:
+            label = f"{streak} streak!"
+            color = (255, 180, 60)
+            font_size = 15
+        else:
+            label = f"{streak} streak"
+            color = (255, 180, 60)
+            font_size = 14
+        label_font = pygame.font.SysFont("Arial", font_size, bold=True)
+        label_surf = label_font.render(label, True, color)
+        surface.blit(label_surf,
+                     (cx - label_surf.get_width() // 2,
+                      y + fire_surf.get_height() + 2))
+
+    def _draw_sparkles(self, surface):
+        """Draw gold sparkle particles."""
+        for x, y, vx, vy, life in self._streak_sparkles:
+            alpha = min(1.0, life * 3)
+            sz = max(2, int(5 * alpha))
+            color = (255, 220, 100)
+            pygame.draw.circle(surface, color, (int(x), int(y)), sz)
+
+    def _spawn_sparkles(self, count=10):
+        """Spawn sparkle particles around the streak area."""
+        cx = SCREEN_WIDTH // 2
+        y = 92
+        for _ in range(count):
+            px = cx + random.randint(-80, 80)
+            py = y + random.randint(-5, 15)
+            vx = random.uniform(-60, 60)
+            vy = random.uniform(-80, -20)
+            life = random.uniform(0.4, 0.8)
+            self._streak_sparkles.append((px, py, vx, vy, life))
+
+    def _draw_results(self, surface, mouse_pos):
+        """Interactive results screen with word-by-word review."""
+        font_big = pygame.font.SysFont("Arial", 36, bold=True)
+        font_med = pygame.font.SysFont("Arial", 22)
+        font_small = pygame.font.SysFont("Arial", 18)
+        font_row = pygame.font.SysFont("Arial", 16)
+        font_badge = pygame.font.SysFont("Arial", 11, bold=True)
+        font_btn = pygame.font.SysFont("Arial", 18, bold=True)
+        font_streak = pygame.font.SysFont("Arial", 16, bold=True)
+        font_divider = pygame.font.SysFont("Arial", 11)
+
+        cx = SCREEN_WIDTH // 2
+
+        # Heading
         if self.score == self.max_score:
-            heading = "Perfect!"
+            heading = "\u2B50 Perfect! \u2B50"
         elif self.score > 0:
             heading = "Good Job!"
         else:
             heading = "Keep Trying!"
-
         t1 = font_big.render(heading, True, OVERLAY_TITLE_COLOR)
-        surface.blit(t1, (SCREEN_WIDTH // 2 - t1.get_width() // 2, cy))
+        surface.blit(t1, (cx - t1.get_width() // 2, 16))
 
+        # Score
         t2 = font_med.render(
             f"Score: {self.score}/{self.max_score}", True, OVERLAY_SCORE_COLOR)
-        surface.blit(t2, (SCREEN_WIDTH // 2 - t2.get_width() // 2, cy + 55))
+        surface.blit(t2, (cx - t2.get_width() // 2, 54))
 
+        # Rewards
         if self.result and isinstance(self.result, dict):
             happiness = self.result.get("happiness", 0)
             xp = self.result.get("xp", 0)
-            t3 = font_med.render(f"+{happiness} Happiness  +{xp} XP",
-                                 True, (255, 220, 100))
-            surface.blit(t3, (SCREEN_WIDTH // 2 - t3.get_width() // 2, cy + 95))
+            t3 = font_small.render(f"+{happiness} Happiness   +{xp} XP",
+                                   True, (255, 220, 100))
+            surface.blit(t3, (cx - t3.get_width() // 2, 80))
+
+        # Divider
+        div_text = font_divider.render("WORD REVIEW", True, (176, 160, 216))
+        dw = div_text.get_width()
+        pygame.draw.line(surface, (58, 53, 96), (30, 110),
+                         (cx - dw // 2 - 8, 110), 1)
+        surface.blit(div_text, (cx - dw // 2, 104))
+        pygame.draw.line(surface, (58, 53, 96), (cx + dw // 2 + 8, 110),
+                         (SCREEN_WIDTH - 30, 110), 1)
+
+        # Word rows
+        row_w = 300
+        row_h = 32
+        rx = cx - row_w // 2
+        y = 124
+
+        # Deduplicate word results (take last result per word)
+        seen_words = {}
+        for english, correct in self.word_results:
+            seen_words[english] = correct
+        unique_results = list(seen_words.items())
+
+        for english, correct in unique_results:
+            row_rect = pygame.Rect(rx, y, row_w, row_h)
+            # Row background
+            if correct:
+                bg_color = (30, 48, 38)
+            else:
+                bg_color = (48, 30, 30)
+            pygame.draw.rect(surface, bg_color, row_rect, border_radius=6)
+
+            # Status icon
+            icon_r = 10
+            icon_cx = rx + 18
+            icon_cy = y + row_h // 2
+            if correct:
+                pygame.draw.circle(surface, (80, 180, 104),
+                                   (icon_cx, icon_cy), icon_r)
+                check = font_badge.render("\u2713", True, WHITE)
+                surface.blit(check, (icon_cx - check.get_width() // 2,
+                                     icon_cy - check.get_height() // 2))
+            else:
+                pygame.draw.circle(surface, (200, 80, 80),
+                                   (icon_cx, icon_cy), icon_r)
+                cross = font_badge.render("\u2717", True, WHITE)
+                surface.blit(cross, (icon_cx - cross.get_width() // 2,
+                                     icon_cy - cross.get_height() // 2))
+
+            # Word pair text
+            from vocabulary import get_word_by_english
+            entry = get_word_by_english(english)
+            polish = entry[0] if entry else "?"
+            if correct:
+                pair_color = (144, 216, 160)
+            else:
+                pair_color = (216, 144, 144)
+            pair = font_row.render(f"{polish} \u2192 {english}", True,
+                                   pair_color)
+            surface.blit(pair, (rx + 36, y + row_h // 2 -
+                                pair.get_height() // 2))
+
+            # NEW / REVIEW badge
+            if self.session:
+                if self.session.is_new_word(english):
+                    badge_surf = font_badge.render("NEW", True, (149, 213, 178))
+                    bw = badge_surf.get_width() + 8
+                    badge_rect = pygame.Rect(
+                        rx + 36 + pair.get_width() + 6,
+                        y + (row_h - 14) // 2, bw, 14)
+                    pygame.draw.rect(surface, (45, 106, 79), badge_rect,
+                                     border_radius=4)
+                    surface.blit(badge_surf, (badge_rect.x + 4, badge_rect.y + 1))
+                elif self.session.is_review_word(english):
+                    badge_surf = font_badge.render("REVIEW", True,
+                                                   (224, 160, 80))
+                    bw = badge_surf.get_width() + 8
+                    badge_rect = pygame.Rect(
+                        rx + 36 + pair.get_width() + 6,
+                        y + (row_h - 14) // 2, bw, 14)
+                    pygame.draw.rect(surface, (90, 58, 30), badge_rect,
+                                     border_radius=4)
+                    surface.blit(badge_surf, (badge_rect.x + 4, badge_rect.y + 1))
+
+            # Speaker icon
+            spk = font_row.render("\U0001F50A", True, (96, 96, 128))
+            spk_x = rx + row_w - 28
+            spk_rect = pygame.Rect(spk_x, y + 4, 28, 28)
+            if spk_rect.collidepoint(mouse_pos):
+                spk = font_row.render("\U0001F50A", True, (160, 160, 200))
+            surface.blit(spk, (spk_x, y + row_h // 2 -
+                               spk.get_height() // 2))
+
+            y += row_h + 4
+
+        # Streak record
+        if self._best_streak >= STREAK_SPARKLE_THRESHOLD:
+            streak_text = f"\U0001F525 Longest streak: {self._best_streak}"
+            if self._best_streak >= STREAK_AMAZING_THRESHOLD:
+                streak_text += " \u2014 AMAZING!"
+            st = font_streak.render(streak_text, True, (255, 180, 60))
+            surface.blit(st, (cx - st.get_width() // 2, y + 4))
+
+        # Continue button
+        hovered = self._continue_rect.collidepoint(mouse_pos)
+        btn_color = (96, 200, 120) if hovered else (80, 180, 104)
+        pygame.draw.rect(surface, btn_color, self._continue_rect,
+                         border_radius=10)
+        btn_surf = font_btn.render("Continue \u25B6", True, WHITE)
+        surface.blit(btn_surf,
+                     (self._continue_rect.centerx - btn_surf.get_width() // 2,
+                      self._continue_rect.centery - btn_surf.get_height() // 2))
 
     def _play_correct(self):
         self.score += 1
         self._flash_timer = 0.4
         self._flash_color = QUIZ_CORRECT_COLOR
+        self._streak += 1
+        self._best_streak = max(self._best_streak, self._streak)
+        # Sparkle effects at thresholds
+        if self._streak == STREAK_SPARKLE_THRESHOLD:
+            self._spawn_sparkles(8)
+            self._streak_flash_timer = 0.5
+        elif self._streak == STREAK_AMAZING_THRESHOLD:
+            self._spawn_sparkles(14)
+            self._streak_flash_timer = 0.8
+        elif self._streak > STREAK_AMAZING_THRESHOLD:
+            self._spawn_sparkles(6)
         if self.sound:
             self.sound.play("correct")
 
     def _play_incorrect(self):
         self._flash_timer = 0.4
         self._flash_color = QUIZ_WRONG_COLOR
+        self._streak = 0
         if self.sound:
             self.sound.play("incorrect")
 

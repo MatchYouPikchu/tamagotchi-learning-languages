@@ -362,6 +362,19 @@ SESSION_SOFT_LIMIT = 30 * 60       # 30 minutes — show warning
 SESSION_HARD_LIMIT = 45 * 60       # 45 minutes — force sleep
 SESSION_WARNING_INTERVAL = 5 * 60  # re-show warning every 5 min after soft limit
 
+# --- Learning Session ---
+SESSION_LEARNING_DURATION = 12 * 60  # 12 minutes per learning session
+SESSION_NEW_WORDS = 5                # target new words per session (4-6 range)
+SESSION_REVIEW_WORDS = 3             # target review/rusty words per session (2-4 range)
+SESSION_MIN_WORDS = 6                # minimum total session words
+SESSION_MAX_WORDS = 10               # maximum total session words
+RUSTY_DAYS_THRESHOLD = 3             # days without seeing a mastered word before it's "rusty"
+
+# Streak visual thresholds
+STREAK_SHOW_THRESHOLD = 2           # show fire counter at this streak
+STREAK_SPARKLE_THRESHOLD = 3        # small sparkle burst
+STREAK_AMAZING_THRESHOLD = 5        # large sparkle + "AMAZING!"
+
 # --- Growth Stages ---
 GROWTH_BABY = "baby"
 GROWTH_KID = "kid"

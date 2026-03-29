@@ -24,7 +24,9 @@ from drawing import PetDrawer
 from ui import UI
 from audio import SoundManager
 from minigames import FoodMenu, CleanMenu, MedicineGame, create_random_minigame
-from edu_games import PlayMenu, MemoryGame, FallingWordGame, SpellingGame, QuizGame, WordBook
+from edu_games import (PlayMenu, MemoryGame, FallingWordGame, SpellingGame,
+                       QuizGame, WordBook, LearningSession, WordIntro,
+                       SessionComplete)
 from save import (list_saves, save_game, load_game, delete_save,
                   find_empty_slot, has_any_save)
 
@@ -534,6 +536,9 @@ class Game:
         self._show_break_warning = False
         self._break_warning_timer = 0.0
 
+        # Learning session
+        self._learning_session = None
+
         # Save system
         self._active_slot = None
         self.autosave_timer = 0.0
@@ -726,7 +731,7 @@ class Game:
     def _do_play(self):
         if self.pet and self.pet.action != "running_away":
             self.sound.play("click")
-            self.sub_state = PlayMenu()
+            self.sub_state = PlayMenu(session=self._learning_session)
 
     def _do_clean(self):
         if self.pet and self.pet.action != "running_away":
@@ -870,6 +875,19 @@ class Game:
                         self._show_break_warning = True
                         self._break_warning_timer = 0.0
 
+            # Learning session timer (ticks during edu games and PlayMenu)
+            if self._learning_session and self._learning_session.active:
+                if isinstance(self.sub_state,
+                              (MemoryGame, FallingWordGame, SpellingGame,
+                               QuizGame, PlayMenu, WordIntro)):
+                    expired = self._learning_session.update(dt)
+                    if expired and not isinstance(self.sub_state,
+                                                  (MemoryGame, FallingWordGame,
+                                                   SpellingGame, QuizGame)):
+                        # Session expired while in menu — show summary
+                        self.sub_state = SessionComplete(
+                            self._learning_session, self.pet.word_mastery)
+
             # Auto-save
             self.autosave_timer += dt
             if self.autosave_timer >= AUTOSAVE_INTERVAL:
@@ -917,40 +935,69 @@ class Game:
                         delete_save(self._active_slot)
                     self.state = STATE_PET_RAN_AWAY
 
+    def _create_edu_game(self, game_key):
+        """Create an edu game instance, injecting session words if active."""
+        session = self._learning_session
+        game_cls = {
+            "memory": MemoryGame,
+            "falling": FallingWordGame,
+            "spelling": SpellingGame,
+            "quiz": QuizGame,
+        }.get(game_key)
+        if not game_cls:
+            return None
+        game = game_cls(
+            self.sound, mastery_data=self.pet.word_mastery,
+            day_count=self.pet.day_count,
+            level=self.pet.level)
+        # Attach session so game can show badges and update streak
+        if session and session.active:
+            game.session = session
+        return game
+
     def _resolve_sub_state(self):
         sub = self.sub_state
         self.sub_state = None
 
-        # PlayMenu → launch selected game
+        # PlayMenu → create session if needed → launch game or intro
         if isinstance(sub, PlayMenu):
             if sub.result:
                 if sub.result == "fun":
                     self.sub_state = create_random_minigame(self.sound)
-                elif sub.result == "memory":
-                    self.sub_state = MemoryGame(
-                        self.sound, mastery_data=self.pet.word_mastery,
-                        day_count=self.pet.day_count,
-                        level=self.pet.level)
-                elif sub.result == "falling":
-                    self.sub_state = FallingWordGame(
-                        self.sound, mastery_data=self.pet.word_mastery,
-                        day_count=self.pet.day_count,
-                        level=self.pet.level)
-                elif sub.result == "spelling":
-                    self.sub_state = SpellingGame(
-                        self.sound, mastery_data=self.pet.word_mastery,
-                        day_count=self.pet.day_count,
-                        level=self.pet.level)
-                elif sub.result == "quiz":
-                    self.sub_state = QuizGame(
-                        self.sound, mastery_data=self.pet.word_mastery,
-                        day_count=self.pet.day_count,
-                        level=self.pet.level)
                 elif sub.result == "wordbook":
                     from vocabulary import get_unlocked_tier
                     self.sub_state = WordBook(
                         self.pet.word_mastery,
                         get_unlocked_tier(self.pet.word_mastery))
+                elif sub.result in ("memory", "falling", "spelling", "quiz"):
+                    # Create learning session if not active
+                    if not self._learning_session or \
+                            not self._learning_session.active:
+                        from vocabulary import get_unlocked_tier
+                        tier = get_unlocked_tier(self.pet.word_mastery)
+                        self._learning_session = LearningSession(
+                            self.pet.word_mastery, tier)
+                    session = self._learning_session
+                    # Show word intro if not shown yet this session
+                    if not session.intro_shown:
+                        session.intro_shown = True
+                        # Store which game to launch after intro
+                        self._pending_game_key = sub.result
+                        self.sub_state = WordIntro(session, self.sound)
+                    else:
+                        self.sub_state = self._create_edu_game(sub.result)
+            return
+
+        # WordIntro → launch the pending game
+        if isinstance(sub, WordIntro):
+            if sub.result == "ready" and hasattr(self, '_pending_game_key'):
+                self.sub_state = self._create_edu_game(self._pending_game_key)
+                del self._pending_game_key
+            return
+
+        # SessionComplete → clear session
+        if isinstance(sub, SessionComplete):
+            self._learning_session = None
             return
 
         # WordBook (no rewards, just close)
@@ -970,11 +1017,24 @@ class Game:
                         self.sound.play("level_up")
                 self.pet.record_edu_game()
                 self.sound.play("play")
+                # Update session
+                if self._learning_session and self._learning_session.active:
+                    self._learning_session.record_game_result(
+                        sub.word_results, xp)
+                # Update pet longest streak
+                if hasattr(sub, '_best_streak'):
+                    self.pet.longest_streak = max(
+                        self.pet.longest_streak, sub._best_streak)
             if hasattr(sub, 'word_results'):
                 for english_word, was_correct in sub.word_results:
                     self.pet.record_word_result(english_word, was_correct)
             # Check for rank-up
             self._check_badge_rank_up()
+            # Check if session expired during game
+            if self._learning_session and \
+                    not self._learning_session.active:
+                self.sub_state = SessionComplete(
+                    self._learning_session, self.pet.word_mastery)
             return
 
         # Food / Clean / Medicine / Fun games
@@ -1046,6 +1106,7 @@ class Game:
             self.runaway_sound_played = False
             self.sub_state = None
             self._last_badge_rank = self.pet.vocab_badge[1]
+            self._learning_session = None
 
     def _draw(self, mouse_pos):
         surface = self.design_surface

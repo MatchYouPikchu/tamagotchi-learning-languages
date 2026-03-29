@@ -10,7 +10,11 @@ Tier 3: verbs, polite phrases (unlock when 10 tier-2 words reach box >= 1)
 """
 
 import random
-from settings import TIER_UNLOCK_THRESHOLD
+import datetime
+from settings import (
+    TIER_UNLOCK_THRESHOLD, SESSION_NEW_WORDS, SESSION_REVIEW_WORDS,
+    SESSION_MIN_WORDS, SESSION_MAX_WORDS, RUSTY_DAYS_THRESHOLD,
+)
 
 # ===================================================================
 # Tier 1 — Basic nouns (~35 words, always unlocked)
@@ -248,3 +252,84 @@ def get_distractors(correct_entry, count=3, tier_unlock=None):
     pool = [w for w in pool if w[1] != correct_entry[1]]
     random.shuffle(pool)
     return pool[:count]
+
+
+def _is_rusty(mastery_entry):
+    """Check if a mastered word is rusty (not seen in RUSTY_DAYS_THRESHOLD+ days)."""
+    last_seen = mastery_entry.get("last_seen")
+    if not last_seen:
+        return False  # no date = treat as recent (backward compat)
+    try:
+        last_date = datetime.date.fromisoformat(last_seen)
+        days_ago = (datetime.date.today() - last_date).days
+        return days_ago >= RUSTY_DAYS_THRESHOLD
+    except (ValueError, TypeError):
+        return False
+
+
+def get_session_words(mastery_data, tier_unlock=None):
+    """Select a balanced set of new + review words for a learning session.
+
+    Returns: (new_words, review_words) — two lists of vocab entries.
+    new_words = unseen words to introduce.
+    review_words = rusty mastered words or struggling words to reinforce.
+    Total size: SESSION_MIN_WORDS to SESSION_MAX_WORDS.
+    """
+    if tier_unlock is None:
+        tier_unlock = get_unlocked_tier(mastery_data)
+
+    pool = [w for w in ALL_VOCAB if w[4] <= tier_unlock]
+
+    # Categorise
+    unseen = [w for w in pool if w[1] not in mastery_data]
+    rusty = [w for w in pool
+             if mastery_data.get(w[1], {}).get("box") == 2
+             and _is_rusty(mastery_data.get(w[1], {}))]
+    box0 = [w for w in pool if mastery_data.get(w[1], {}).get("box") == 0]
+    box1 = [w for w in pool if mastery_data.get(w[1], {}).get("box") == 1]
+
+    random.shuffle(unseen)
+    random.shuffle(rusty)
+    random.shuffle(box0)
+    random.shuffle(box1)
+
+    # Pick new words (target SESSION_NEW_WORDS, min 2)
+    n_new = min(len(unseen), SESSION_NEW_WORDS)
+    n_new = max(n_new, min(2, len(unseen)))  # at least 2 if available
+    new_words = unseen[:n_new]
+
+    # Pick review words: prefer rusty, then box0 (struggling), then box1
+    n_review = SESSION_REVIEW_WORDS
+    review_words = []
+    review_words.extend(rusty[:n_review])
+    remaining_review = n_review - len(review_words)
+    if remaining_review > 0:
+        review_words.extend(box0[:remaining_review])
+        remaining_review = n_review - len(review_words)
+    if remaining_review > 0:
+        review_words.extend(box1[:remaining_review])
+
+    # Remove duplicates (a word shouldn't be in both lists)
+    new_english = {w[1] for w in new_words}
+    review_words = [w for w in review_words if w[1] not in new_english]
+
+    # Enforce total bounds
+    total = len(new_words) + len(review_words)
+    if total < SESSION_MIN_WORDS:
+        # Fill from any available pool words not already selected
+        used = new_english | {w[1] for w in review_words}
+        filler = [w for w in pool if w[1] not in used]
+        random.shuffle(filler)
+        needed = SESSION_MIN_WORDS - total
+        review_words.extend(filler[:needed])
+    elif total > SESSION_MAX_WORDS:
+        # Trim review words first, then new words
+        excess = total - SESSION_MAX_WORDS
+        if len(review_words) > excess:
+            review_words = review_words[:len(review_words) - excess]
+        else:
+            excess -= len(review_words)
+            review_words = []
+            new_words = new_words[:len(new_words) - excess]
+
+    return new_words, review_words

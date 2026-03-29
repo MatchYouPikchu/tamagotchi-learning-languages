@@ -1,6 +1,7 @@
 """Pet class — stats, state machine, decay, sickness, evolution."""
 
 import time
+import datetime
 from settings import (
     STAT_MAX, STAT_START, STAT_SICK_THRESHOLD,
     HUNGER_DECAY_DAY, HUNGER_DECAY_NIGHT,
@@ -69,9 +70,13 @@ class Pet:
         self.stage_just_changed = False
 
         # Word mastery tracking
-        # Key = english word, Value = {"box": 0-2, "correct": N, "wrong": N, "streak": N}
+        # Key = english word, Value = {"box": 0-2, "correct": N, "wrong": N,
+        #   "streak": N, "last_seen": "YYYY-MM-DD"}
         # box 0 = new/struggling, box 1 = learning, box 2 = mastered
         self.word_mastery = {}
+
+        # Longest correct-answer streak ever achieved (for badge/display)
+        self.longest_streak = 0
 
         # Custom appearance (from pet designer)
         self.appearance = {
@@ -215,6 +220,7 @@ class Pet:
                 "box": 0, "correct": 0, "wrong": 0, "streak": 0,
             }
         entry = self.word_mastery[english_word]
+        entry["last_seen"] = datetime.date.today().isoformat()
         if correct:
             entry["correct"] += 1
             entry["streak"] += 1
@@ -304,6 +310,7 @@ class Pet:
             "total_play_seconds": self.total_play_seconds,
             "word_mastery": self.word_mastery,
             "appearance": self.appearance,
+            "longest_streak": self.longest_streak,
         }
 
     @classmethod
@@ -320,6 +327,7 @@ class Pet:
             if key in data:
                 setattr(pet, key, data[key])
         pet.word_mastery = data.get("word_mastery", {})
+        pet.longest_streak = data.get("longest_streak", 0)
         # Restore appearance with backward compat (old saves lack this key)
         saved_appearance = data.get("appearance", {})
         if saved_appearance:
