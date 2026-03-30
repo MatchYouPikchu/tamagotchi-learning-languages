@@ -3,4 +3,3 @@ __pycache__/
 assets/speech/
 .env
 saves/
-.claude/
